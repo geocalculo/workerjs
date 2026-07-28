@@ -1,5 +1,20 @@
 {
-  "name": "workerjs",
+  "name": "hidden-mud-ce7a",
   "main": "worker.js",
-  "compatibility_date": "2026-07-28"
+  "compatibility_date": "2026-07-28",
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "geocalculo-registros",
+      "database_id": "4ea36f59-b15f-4f58-a8c6-de31838d499c"
+    }
+  ],
+
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVOS",
+      "bucket_name": "geocalculo-descargas"
+    }
+  ]
 }
