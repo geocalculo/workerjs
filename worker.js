@@ -39,6 +39,9 @@ const ESTADOS_VALIDOS = new Set([
 ]);
 
 const ORIGENES_EXACTOS = new Set([
+  "http://localhost",
+  "http://127.0.0.1",
+
   "https://geocalculo.cl",
   "https://www.geocalculo.cl",
 
@@ -164,6 +167,33 @@ export default {
 
     // =========================================================
     // GEODASH
+    // ENDPOINT CONSOLIDADO
+    // =========================================================
+
+    if (url.pathname === "/dashboard") {
+
+      if (request.method !== "GET") {
+
+        return responder(
+          {
+            ok: false,
+            error: "Método no permitido"
+          },
+          405,
+          corsHeaders
+        );
+      }
+
+      return obtenerDashboard(
+        url,
+        env,
+        corsHeaders
+      );
+    }
+
+
+    // =========================================================
+    // GEODASH
     // RESUMEN OPERACIONAL
     // =========================================================
 
@@ -229,6 +259,242 @@ export default {
     );
   }
 };
+
+
+// =============================================================
+// GEODASH
+// DATOS CONSOLIDADOS
+// =============================================================
+
+async function obtenerDashboard(
+  url,
+  env,
+  corsHeaders
+) {
+
+  const daysParam =
+    url.searchParams.get("days");
+
+  const limitParam =
+    url.searchParams.get("limit");
+
+  const days =
+    daysParam === null
+      ? 30
+      : Number(daysParam);
+
+  const limit =
+    limitParam === null
+      ? 20
+      : Number(limitParam);
+
+
+  if (
+    !Number.isInteger(days) ||
+    ![7, 30].includes(days) ||
+    !Number.isInteger(limit) ||
+    limit < 1 ||
+    limit > 100
+  ) {
+
+    return responder(
+      {
+        ok: false,
+        error:
+          "Parámetros no válidos: days debe ser 7 o 30 y limit debe estar entre 1 y 100"
+      },
+      400,
+      corsHeaders
+    );
+  }
+
+
+  const inicioPeriodo =
+    `-${days - 1} days`;
+
+
+  try {
+
+    const [
+      kpis,
+      actividadResultado,
+      sitiosResultado,
+      origenesResultado,
+      eventosResultado
+    ] = await Promise.all([
+
+      env.DB
+        .prepare(`
+          SELECT
+            SUM(CASE WHEN tipo_evento = 'consulta' THEN 1 ELSE 0 END) AS consultas_hoy,
+            COUNT(DISTINCT CASE
+              WHEN session_id IS NOT NULL AND TRIM(session_id) <> ''
+              THEN session_id
+            END) AS sesiones_hoy,
+            SUM(CASE WHEN tipo_evento = 'geoquery_open' THEN 1 ELSE 0 END) AS geoquery_abiertos,
+            SUM(CASE WHEN tipo_evento = 'cross_access' THEN 1 ELSE 0 END) AS cross_access
+          FROM eventos_geocalculo
+          WHERE date(fecha_hora) = date('now')
+        `)
+        .first(),
+
+      env.DB
+        .prepare(`
+          SELECT
+            date(fecha_hora) AS date,
+            COUNT(*) AS count
+          FROM eventos_geocalculo
+          WHERE date(fecha_hora) BETWEEN date('now', ?) AND date('now')
+          GROUP BY date(fecha_hora)
+          ORDER BY date ASC
+        `)
+        .bind(inicioPeriodo)
+        .all(),
+
+      env.DB
+        .prepare(`
+          SELECT
+            sitio AS site,
+            COUNT(*) AS count
+          FROM eventos_geocalculo
+          WHERE
+            date(fecha_hora) BETWEEN date('now', ?) AND date('now')
+            AND sitio IS NOT NULL
+            AND TRIM(sitio) <> ''
+          GROUP BY sitio
+          ORDER BY count DESC, site ASC
+        `)
+        .bind(inicioPeriodo)
+        .all(),
+
+      env.DB
+        .prepare(`
+          SELECT
+            origen AS origin,
+            COUNT(*) AS count
+          FROM eventos_geocalculo
+          WHERE
+            date(fecha_hora) BETWEEN date('now', ?) AND date('now')
+            AND origen IS NOT NULL
+            AND TRIM(origen) <> ''
+          GROUP BY origen
+          ORDER BY count DESC, origin ASC
+        `)
+        .bind(inicioPeriodo)
+        .all(),
+
+      env.DB
+        .prepare(`
+          SELECT
+            fecha_hora,
+            sitio,
+            tipo_evento,
+            origen,
+            latitud,
+            longitud
+          FROM eventos_geocalculo
+          ORDER BY fecha_hora DESC
+          LIMIT ?
+        `)
+        .bind(limit)
+        .all()
+    ]);
+
+
+    const actividadPorFecha =
+      new Map(
+        (actividadResultado.results || [])
+          .map(fila => [
+            fila.date,
+            Number(fila.count || 0)
+          ])
+      );
+
+
+    const activity = [];
+    const hoy = new Date();
+
+
+    for (
+      let desplazamiento = days - 1;
+      desplazamiento >= 0;
+      desplazamiento -= 1
+    ) {
+
+      const fecha =
+        new Date(
+          Date.UTC(
+            hoy.getUTCFullYear(),
+            hoy.getUTCMonth(),
+            hoy.getUTCDate() - desplazamiento
+          )
+        )
+          .toISOString()
+          .slice(0, 10);
+
+
+      activity.push({
+        date: fecha,
+        count:
+          actividadPorFecha.get(fecha) || 0
+      });
+    }
+
+
+    return responder(
+      {
+        ok: true,
+        updated_at: new Date().toISOString(),
+        period_days: days,
+        kpis: {
+          consultas_hoy:
+            Number(kpis?.consultas_hoy ?? 0),
+          sesiones_hoy:
+            Number(kpis?.sesiones_hoy ?? 0),
+          geoquery_abiertos:
+            Number(kpis?.geoquery_abiertos ?? 0),
+          cross_access:
+            Number(kpis?.cross_access ?? 0)
+        },
+        activity,
+        sites:
+          (sitiosResultado.results || [])
+            .map(fila => ({
+              site: fila.site,
+              count: Number(fila.count || 0)
+            })),
+        origins:
+          (origenesResultado.results || [])
+            .map(fila => ({
+              origin: fila.origin,
+              count: Number(fila.count || 0)
+            })),
+        countries: [],
+        events:
+          eventosResultado.results || []
+      },
+      200,
+      corsHeaders
+    );
+
+  } catch (error) {
+
+    console.error(
+      "Error obteniendo datos GeoDash:",
+      error
+    );
+
+    return responder(
+      {
+        ok: false,
+        error:
+          "No fue posible obtener los datos del dashboard"
+      },
+      500,
+      corsHeaders
+    );
+  }
+}
 
 
 // =============================================================
