@@ -65,6 +65,24 @@ const ORIGENES_EXACTOS = new Set([
 // Los PDF/KML de GeoQuery deberían estar muy por debajo de esto.
 const MAX_ARCHIVO_BYTES = 25 * 1024 * 1024;
 
+const PERIODOS_ANALYTICS = new Map([
+  ["day", "day"],
+  ["today", "day"],
+  ["daily", "day"],
+  ["week", "week"],
+  ["semana", "week"],
+  ["month", "month"],
+  ["monthly", "month"],
+  ["mes", "month"]
+]);
+
+const SITIOS_ANALYTICS = [
+  "geoipt",
+  "geoeva",
+  "geonemo",
+  "geonoxa"
+];
+
 
 export default {
 
@@ -166,6 +184,32 @@ export default {
 
 
     // =========================================================
+    // DIAGNÓSTICO Y ANALYTICS GEODASH
+    // Los cortes temporales se calculan por días calendario UTC,
+    // la misma convención utilizada por date('now') en D1.
+    // =========================================================
+
+    if (url.pathname === "/health") {
+
+      if (request.method !== "GET") {
+        return metodoNoPermitido(corsHeaders);
+      }
+
+      return obtenerHealth(env, corsHeaders);
+    }
+
+
+    if (url.pathname === "/analytics") {
+
+      if (request.method !== "GET") {
+        return metodoNoPermitido(corsHeaders);
+      }
+
+      return obtenerAnalytics(url, env, corsHeaders);
+    }
+
+
+    // =========================================================
     // GEODASH
     // ENDPOINT CONSOLIDADO
     // =========================================================
@@ -259,6 +303,393 @@ export default {
     );
   }
 };
+
+
+// =============================================================
+// HEALTH
+// =============================================================
+
+async function obtenerHealth(env, corsHeaders) {
+
+  let database = false;
+
+  try {
+    const comprobacion = await env.DB
+      .prepare("SELECT 1 AS ok")
+      .first();
+
+    database = Number(comprobacion?.ok) === 1;
+  } catch (error) {
+    console.error("Error comprobando D1:", error);
+  }
+
+  return responder(
+    {
+      ok: database,
+      service: "geocalculo-registro-api",
+      database,
+      analytics_route: true,
+      version: "analytics-v1"
+    },
+    database ? 200 : 503,
+    corsHeaders
+  );
+}
+
+
+// =============================================================
+// ANALYTICS GEODASH
+// =============================================================
+
+async function obtenerAnalytics(url, env, corsHeaders) {
+
+  const periodoSolicitado = String(
+    url.searchParams.get("period") || "week"
+  ).trim().toLowerCase();
+
+  const period = PERIODOS_ANALYTICS.get(periodoSolicitado);
+
+  if (!period) {
+    return responder(
+      {
+        ok: false,
+        error: "Periodo no válido",
+        allowed_periods: ["day", "week", "month"]
+      },
+      400,
+      corsHeaders
+    );
+  }
+
+  const limites = obtenerLimitesPeriodo(period);
+  const formatoAgrupacion = period === "day" ? "%Y-%m-%dT%H:00:00.000Z" : "%Y-%m-%d";
+  try {
+    const [
+      consultasResultado,
+      tendenciaResultado,
+      sitiosResultado,
+      heatmapResultado,
+      journeyResultado,
+      tendenciaSitiosResultado
+    ] = await Promise.all([
+      env.DB.prepare(`
+        SELECT
+          SUM(CASE WHEN datetime(fecha_hora) >= datetime(?) THEN 1 ELSE 0 END) AS current,
+          SUM(CASE WHEN datetime(fecha_hora) < datetime(?) THEN 1 ELSE 0 END) AS previous
+        FROM eventos_geocalculo
+        WHERE tipo_evento = 'consulta'
+          AND datetime(fecha_hora) >= datetime(?)
+          AND datetime(fecha_hora) < datetime(?)
+      `).bind(
+        limites.actualInicio,
+        limites.actualInicio,
+        limites.anteriorInicio,
+        limites.actualFin
+      ).first(),
+
+      env.DB.prepare(`
+        SELECT strftime(?, fecha_hora) AS bucket, COUNT(*) AS count
+        FROM eventos_geocalculo
+        WHERE tipo_evento = 'consulta'
+          AND datetime(fecha_hora) >= datetime(?)
+          AND datetime(fecha_hora) < datetime(?)
+        GROUP BY bucket
+        ORDER BY bucket ASC
+      `).bind(formatoAgrupacion, limites.actualInicio, limites.actualFin).all(),
+
+      env.DB.prepare(`
+        SELECT sitio,
+          SUM(CASE WHEN datetime(fecha_hora) >= datetime(?) THEN 1 ELSE 0 END) AS current,
+          SUM(CASE WHEN datetime(fecha_hora) < datetime(?) THEN 1 ELSE 0 END) AS previous
+        FROM eventos_geocalculo
+        WHERE tipo_evento = 'consulta'
+          AND datetime(fecha_hora) >= datetime(?)
+          AND datetime(fecha_hora) < datetime(?)
+          AND sitio IN ('geoipt', 'geoeva', 'geonemo', 'geonoxa')
+        GROUP BY sitio
+      `).bind(
+        limites.actualInicio,
+        limites.actualInicio,
+        limites.anteriorInicio,
+        limites.actualFin
+      ).all(),
+
+      env.DB.prepare(`
+        SELECT
+          CAST(strftime('%w', fecha_hora) AS INTEGER) AS day,
+          CAST(strftime('%H', fecha_hora) AS INTEGER) AS hour,
+          COUNT(*) AS value
+        FROM eventos_geocalculo
+        WHERE datetime(fecha_hora) >= datetime(?)
+          AND datetime(fecha_hora) < datetime(?)
+        GROUP BY day, hour
+      `).bind(limites.actualInicio, limites.actualFin).all(),
+
+      env.DB.prepare(`
+        SELECT tipo_evento, COUNT(*) AS count
+        FROM eventos_geocalculo
+        WHERE datetime(fecha_hora) >= datetime(?)
+          AND datetime(fecha_hora) < datetime(?)
+          AND tipo_evento IN (
+            'index_load', 'consulta', 'geoquery_open',
+            'descarga_pdf', 'pdf', 'descarga_kml', 'kml'
+          )
+        GROUP BY tipo_evento
+      `).bind(limites.actualInicio, limites.actualFin).all(),
+
+      env.DB.prepare(`
+        SELECT strftime(?, fecha_hora) AS bucket, sitio, COUNT(*) AS count
+        FROM eventos_geocalculo
+        WHERE tipo_evento = 'consulta'
+          AND datetime(fecha_hora) >= datetime(?)
+          AND datetime(fecha_hora) < datetime(?)
+          AND sitio IN ('geoipt', 'geoeva', 'geonemo', 'geonoxa')
+        GROUP BY bucket, sitio
+        ORDER BY bucket ASC
+      `).bind(formatoAgrupacion, limites.actualInicio, limites.actualFin).all()
+    ]);
+
+    const current = numeroSeguro(consultasResultado?.current);
+    const previous = numeroSeguro(consultasResultado?.previous);
+    const trend = construirTrend(
+      period,
+      limites,
+      tendenciaResultado.results || []
+    );
+    const journey = construirJourney(journeyResultado.results || []);
+
+    return responder(
+      {
+        ok: true,
+        period,
+        generated_at: new Date().toISOString(),
+        timezone: "UTC",
+        heatmap_day_convention: "0 = domingo, 1 = lunes, ..., 6 = sábado",
+        summary: {
+          current,
+          previous,
+          variation: calcularPorcentaje(current, previous),
+          final_conversion: calcularConversion(
+            journey.find(item => item.stage === "kml")?.count || 0,
+            journey.find(item => item.stage === "index")?.count || 0
+          )
+        },
+        trend,
+        site_distribution: construirDistribucionSitios(
+          sitiosResultado.results || [],
+          current
+        ),
+        heatmap: construirHeatmap(
+          period,
+          heatmapResultado.results || []
+        ),
+        journey,
+        site_trend: construirTendenciaSitios(
+          trend,
+          tendenciaSitiosResultado.results || []
+        )
+      },
+      200,
+      corsHeaders
+    );
+  } catch (error) {
+    console.error("Error obteniendo analytics:", error);
+
+    return responder(
+      {
+        ok: false,
+        error: "No fue posible obtener los datos de analytics"
+      },
+      500,
+      corsHeaders
+    );
+  }
+}
+
+
+function obtenerLimitesPeriodo(period, ahora = new Date()) {
+  const fin = new Date(Date.UTC(
+    ahora.getUTCFullYear(),
+    ahora.getUTCMonth(),
+    ahora.getUTCDate() + 1
+  ));
+  const dias = period === "day" ? 1 : period === "week" ? 7 : 30;
+  const inicio = new Date(fin);
+  inicio.setUTCDate(inicio.getUTCDate() - dias);
+  const anterior = new Date(inicio);
+  anterior.setUTCDate(anterior.getUTCDate() - dias);
+
+  return {
+    actualInicio: inicio.toISOString(),
+    actualFin: fin.toISOString(),
+    anteriorInicio: anterior.toISOString(),
+    dias
+  };
+}
+
+
+function construirTrend(period, limites, filas) {
+  const valores = new Map(
+    filas.map(fila => [String(fila.bucket), numeroSeguro(fila.count)])
+  );
+  const resultado = [];
+  const cantidad = period === "day" ? 24 : limites.dias;
+
+  for (let indice = 0; indice < cantidad; indice += 1) {
+    const fecha = new Date(limites.actualInicio);
+    if (period === "day") {
+      fecha.setUTCHours(fecha.getUTCHours() + indice);
+    } else {
+      fecha.setUTCDate(fecha.getUTCDate() + indice);
+    }
+
+    const timestamp = period === "day"
+      ? fecha.toISOString().replace(/:\d{2}\.\d{3}Z$/, ":00.000Z")
+      : `${fecha.toISOString().slice(0, 10)}T00:00:00.000Z`;
+    const bucket = period === "day" ? timestamp : timestamp.slice(0, 10);
+    const consultas = valores.get(bucket) || 0;
+    const desde = Math.max(0, resultado.length - 6);
+    const ventana = resultado.slice(desde).map(item => item.consultas);
+    ventana.push(consultas);
+
+    resultado.push({
+      label: period === "day" ? `${String(fecha.getUTCHours()).padStart(2, "0")}:00` : etiquetaFecha(fecha),
+      timestamp,
+      consultas,
+      moving_average: redondear(
+        ventana.reduce((total, valor) => total + valor, 0) / ventana.length
+      )
+    });
+  }
+
+  return resultado;
+}
+
+
+function construirDistribucionSitios(filas, totalActual) {
+  const porSitio = new Map(filas.map(fila => [fila.sitio, fila]));
+
+  return SITIOS_ANALYTICS.map(site => {
+    const fila = porSitio.get(site) || {};
+    const current = numeroSeguro(fila.current);
+    const previous = numeroSeguro(fila.previous);
+
+    return {
+      site,
+      current,
+      previous,
+      variation: calcularPorcentaje(current, previous),
+      share: totalActual > 0 ? redondear(current / totalActual * 100) : 0
+    };
+  });
+}
+
+
+function construirHeatmap(period, filas) {
+  const valores = new Map(
+    filas.map(fila => [`${numeroSeguro(fila.day)}-${numeroSeguro(fila.hour)}`, numeroSeguro(fila.value)])
+  );
+  const dias = period === "day" ? [new Date().getUTCDay()] : [0, 1, 2, 3, 4, 5, 6];
+  const resultado = [];
+
+  for (const day of dias) {
+    for (let hour = 0; hour < 24; hour += 1) {
+      resultado.push({ day, hour, value: valores.get(`${day}-${hour}`) || 0 });
+    }
+  }
+
+  return resultado;
+}
+
+
+function construirJourney(filas) {
+  const etapas = [
+    ["index", ["index_load"]],
+    ["consulta", ["consulta"]],
+    ["geoquery", ["geoquery_open"]],
+    ["pdf", ["descarga_pdf", "pdf"]],
+    ["kml", ["descarga_kml", "kml"]]
+  ];
+  const conteos = new Map(
+    filas.map(fila => [fila.tipo_evento, numeroSeguro(fila.count)])
+  );
+  let anterior = 0;
+
+  return etapas.map(([stage, tipos], indice) => {
+    const count = tipos.reduce((total, tipo) => total + (conteos.get(tipo) || 0), 0);
+    const conversion = indice === 0 ? (count > 0 ? 100 : 0) : calcularConversion(count, anterior);
+    const item = {
+      stage,
+      count,
+      conversion_from_previous: conversion,
+      dropoff: anterior > 0 ? redondear(Math.max(0, 100 - conversion)) : 0
+    };
+    anterior = count;
+    return item;
+  });
+}
+
+
+function construirTendenciaSitios(trend, filas) {
+  const valores = new Map();
+  const usaHoras = filas.some(fila => String(fila.bucket).includes("T"));
+
+  for (const fila of filas) {
+    const key = `${fila.bucket}|${fila.sitio}`;
+    valores.set(key, numeroSeguro(fila.count));
+  }
+
+  return trend.map(item => {
+    const bucket = usaHoras ? item.timestamp : item.timestamp.slice(0, 10);
+    const punto = { label: item.label, timestamp: item.timestamp };
+    for (const sitio of SITIOS_ANALYTICS) {
+      punto[sitio] = valores.get(`${bucket}|${sitio}`) || 0;
+    }
+    return punto;
+  });
+}
+
+
+function etiquetaFecha(fecha) {
+  const meses = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+  return `${fecha.getUTCDate()} ${meses[fecha.getUTCMonth()]}`;
+}
+
+
+function numeroSeguro(valor) {
+  const numero = Number(valor);
+  return Number.isFinite(numero) ? numero : 0;
+}
+
+
+function redondear(valor) {
+  return Number.isFinite(valor) ? Math.round(valor * 10) / 10 : 0;
+}
+
+
+function calcularPorcentaje(actual, base) {
+  if (base <= 0) {
+    return 0;
+  }
+  return redondear((actual - base) / base * 100);
+}
+
+
+function calcularConversion(actual, base) {
+  if (base <= 0) {
+    return 0;
+  }
+  return redondear(actual / base * 100);
+}
+
+
+function metodoNoPermitido(corsHeaders) {
+  return responder(
+    { ok: false, error: "Método no permitido" },
+    405,
+    corsHeaders
+  );
+}
 
 
 // =============================================================
